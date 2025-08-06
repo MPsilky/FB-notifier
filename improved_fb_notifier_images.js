@@ -15,6 +15,22 @@ const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const nodemailer = require('nodemailer');
 const fs = require('fs');
 
+// Load category average prices if available.  These values can be computed
+// from the Mercari dataset using mercari_ratio_loader.js.  The file should
+// map category names to their average sale price.  If the file is missing
+// or invalid, categoryAvgPrices will be an empty object.  When computing
+// resale values for free items, we will try to match the listing title to
+// one of these categories and estimate half of the average price.
+let categoryAvgPrices = {};
+try {
+  if (fs.existsSync('./categoryAvgPrice.json')) {
+    categoryAvgPrices = JSON.parse(fs.readFileSync('./categoryAvgPrice.json', 'utf-8'));
+  }
+} catch (e) {
+  console.warn('Failed to load categoryAvgPrice.json:', e.message);
+  categoryAvgPrices = {};
+}
+
 puppeteer.use(StealthPlugin());
 
 // Configuration object.  Most of the fields mirror those in the basic
@@ -86,7 +102,32 @@ function estimateResaleValue(priceStr, title, description) {
     const estimate = (num * 0.5).toFixed(2);
     return `$${estimate}`;
   }
-  // If price is not available (free items), there's no obvious resale value.
+  // If price is not available (free items), attempt to estimate a resale
+  // value based on the listing title and our category averages.  We look
+  // through the categoryAvgPrices keys and select the first category whose
+  // name appears in the title.  If a match is found, we assume the item is
+  // worth about half of the average sale price for that category.  If no
+  // category matches or categoryAvgPrices is empty, we return 'n/a'.
+  const lowerTitle = title.toLowerCase();
+  let matchedCategory = null;
+  for (const categoryName of Object.keys(categoryAvgPrices)) {
+    const tokens = categoryName.toLowerCase().split(/\s*\/\s*|\s+>/g);
+    for (const token of tokens) {
+      if (token && lowerTitle.includes(token)) {
+        matchedCategory = categoryName;
+        break;
+      }
+    }
+    if (matchedCategory) break;
+  }
+  if (matchedCategory) {
+    const avg = categoryAvgPrices[matchedCategory];
+    if (typeof avg === 'number' && avg > 0) {
+      const estimate = (avg * 0.5).toFixed(2);
+      return `$${estimate}`;
+    }
+  }
+  // No matching category found or no data: fallback to n/a
   return 'n/a';
 }
 
@@ -128,7 +169,13 @@ async function fetchListingDetails(page, link) {
   const result = { description: '', image: '' };
   try {
     await page.goto(link, { waitUntil: 'load' });
-    await page.waitForTimeout(3000);
+    // In some older versions of Puppeteer, waitForTimeout is not defined.
+    // Use waitFor as a fallback to pause for a set number of milliseconds.
+    if (typeof page.waitForTimeout === 'function') {
+      await page.waitForTimeout(3000);
+    } else {
+      await page.waitFor(3000);
+    }
     // Extract description text.  Facebook may change selectors frequently;
     // these selectors are approximate and may need adjusting.
     const description = await page.evaluate(() => {
@@ -153,7 +200,12 @@ async function scrapeTerm(page, term, pastItems) {
   const url = buildSearchUrl(term);
   console.log(`\nSearching Marketplace for "${term}": ${url}`);
   await page.goto(url, { waitUntil: 'load' });
-  await page.waitForTimeout(5000);
+  // Use waitForTimeout when available; fall back to waitFor for older Puppeteer versions.
+  if (typeof page.waitForTimeout === 'function') {
+    await page.waitForTimeout(5000);
+  } else {
+    await page.waitFor(5000);
+  }
   const bodyHTML = await page.evaluate(() => document.body.outerHTML);
   const match = bodyHTML.match(/"marketplace_search".*?,"marketplace_seo_page"/);
   if (!match) {
